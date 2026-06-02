@@ -47,6 +47,8 @@ STARTUP_TIMEOUT = 30.0
 PROJECT_DIR = Path(__file__).resolve().parent
 SERVER_SCRIPT = PROJECT_DIR / 'tts_server.py'
 
+SUPPORTED_OUTPUT_FORMATS = {'.wav': 'wav', '.mp3': 'mp3', '.aac': 'aac'}
+
 
 def server_alive(sock_path: str = SOCKET_PATH) -> bool:
     """Return True iff a server answers ping on the socket."""
@@ -159,11 +161,35 @@ def write_wav(pcm_bytes: bytes) -> Path:
     return Path(path)
 
 
-def play(wav_path: Path, background: bool) -> int:
-    """Hand off to afplay. Returns process exit code (0 for --bg)."""
+def save_audio(audio_np: np.ndarray, sr: int, path: Path, fmt: str) -> None:
+    """Save audio to PATH in the requested format. Creates parent dirs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == 'wav':
+        sf.write(str(path), audio_np, sr, format='WAV')
+        return
+    # mp3 / aac: round-trip through in-memory WAV → AudioSegment → export.
+    from pydub import AudioSegment
+    buf = io.BytesIO()
+    sf.write(buf, audio_np, sr, format='WAV')
+    buf.seek(0)
+    segment = AudioSegment.from_wav(buf)
+    if fmt == 'aac':
+        segment = segment.set_channels(1)
+        segment.export(str(path), format='adts', codec='aac', bitrate='64k')
+    else:  # mp3
+        segment.export(str(path), format='mp3', bitrate='128k')
+
+
+def play(wav_path: Path, background: bool, delete_after: bool = True) -> int:
+    """Hand off to afplay. Returns process exit code (0 for --bg).
+
+    When delete_after is False the file is left in place after playback —
+    used when playing back the user's own --output file.
+    """
     if background:
+        cleanup = f'; rm -f {wav_path!s}' if delete_after else ''
         subprocess.Popen(
-            ['/bin/sh', '-c', f'afplay {wav_path!s}; rm -f {wav_path!s}'],
+            ['/bin/sh', '-c', f'afplay {wav_path!s}{cleanup}'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
@@ -175,10 +201,11 @@ def play(wav_path: Path, background: bool) -> int:
         result = subprocess.run(['afplay', str(wav_path)])
         return result.returncode
     finally:
-        try:
-            wav_path.unlink()
-        except OSError:
-            pass
+        if delete_after:
+            try:
+                wav_path.unlink()
+            except OSError:
+                pass
 
 
 def main() -> int:
@@ -201,10 +228,24 @@ def main() -> int:
     parser.add_argument('--voice', default=None,
                         help='For --engine chatterbox: path to a reference WAV or a '
                              'nickname registered in voices/registry.json')
+    parser.add_argument('-o', '--output', type=Path, default=None,
+                        help='Save synthesized audio to PATH. Format inferred from '
+                             'extension: .wav, .mp3, .aac')
+    parser.add_argument('--no-play', action='store_true',
+                        help='Suppress playback (only meaningful with --output)')
     args = parser.parse_args()
 
     if args.engine == 'chatterbox' and not args.voice:
         parser.error('--engine chatterbox requires --voice (path or nickname)')
+
+    output_fmt = None
+    if args.output:
+        output_fmt = SUPPORTED_OUTPUT_FORMATS.get(args.output.suffix.lower())
+        if output_fmt is None:
+            parser.error(
+                f'unsupported output extension {args.output.suffix!r}; '
+                f'use one of: {", ".join(SUPPORTED_OUTPUT_FORMATS)}'
+            )
 
     if args.text:
         text = ' '.join(args.text)
@@ -226,8 +267,18 @@ def main() -> int:
     if not pcm:
         return 0
 
-    wav_path = write_wav(pcm)
-    code = play(wav_path, background=args.bg)
+    if args.output:
+        audio = np.frombuffer(pcm, dtype=np.float32)
+        save_audio(audio, SAMPLE_RATE, args.output, output_fmt)
+        print(f'saved {args.output}', file=sys.stderr)
+        if args.no_play:
+            return 0
+        # afplay handles wav/mp3/aac natively on macOS.
+        code = play(args.output, background=args.bg, delete_after=False)
+    else:
+        wav_path = write_wav(pcm)
+        code = play(wav_path, background=args.bg)
+
     if code != 0:
         sys.stderr.write(f'afplay exited {code}\n')
         return 5
