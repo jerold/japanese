@@ -108,17 +108,22 @@ def ensure_server() -> None:
         sys.exit(3)
 
 
-def synthesize(text: str, en_voice: str, jp_voice: str, switch_gap_ms: int) -> bytes:
+def synthesize(text: str, en_voice: str, jp_voice: str, switch_gap_ms: int,
+               engine: str = 'kokoro', voice: str | None = None) -> bytes:
     """Send a synthesis request, return raw float32 PCM bytes."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(SOCKET_PATH)
     try:
-        request = json.dumps({
+        payload = {
             'text': text,
             'en_voice': en_voice,
             'jp_voice': jp_voice,
             'switch_gap_ms': switch_gap_ms,
-        })
+            'engine': engine,
+        }
+        if voice is not None:
+            payload['voice'] = voice
+        request = json.dumps(payload)
         sock.sendall(request.encode() + b'\n')
 
         rfile = sock.makefile('rb')
@@ -191,7 +196,15 @@ def main() -> int:
                         help='Japanese Kokoro voice (default: jf_alpha)')
     parser.add_argument('--switch-gap-ms', type=int, default=60,
                         help='Silence between language-switched segments (default: 60ms)')
+    parser.add_argument('--engine', choices=['kokoro', 'chatterbox'], default='kokoro',
+                        help='TTS engine (default: kokoro). Use chatterbox for cloned voices.')
+    parser.add_argument('--voice', default=None,
+                        help='For --engine chatterbox: path to a reference WAV or a '
+                             'nickname registered in voices/registry.json')
     args = parser.parse_args()
+
+    if args.engine == 'chatterbox' and not args.voice:
+        parser.error('--engine chatterbox requires --voice (path or nickname)')
 
     if args.text:
         text = ' '.join(args.text)
@@ -208,7 +221,8 @@ def main() -> int:
         return 0
 
     ensure_server()
-    pcm = synthesize(text, args.en_voice, args.jp_voice, args.switch_gap_ms)
+    pcm = synthesize(text, args.en_voice, args.jp_voice, args.switch_gap_ms,
+                     engine=args.engine, voice=args.voice)
     if not pcm:
         return 0
 

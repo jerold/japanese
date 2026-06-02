@@ -9,6 +9,9 @@ the ~4.4s model-loading cost per invocation. Uses a JSON-line protocol:
     ← {"status": "ok", "sample_rate": 24000, "num_samples": N, "byte_length": M}
     ← <M bytes of raw float32 PCM>
 
+    Cloned voice (English-only) via Chatterbox, loaded lazily on first use:
+    → {"text": "Hello", "engine": "chatterbox", "voice": "voices/jerold.wav"}
+
     → {"command": "ping"}      ← {"status": "ok", "message": "pong"}
     → {"command": "shutdown"}  ← {"status": "ok", "message": "shutting down"}
 
@@ -27,16 +30,24 @@ import socket
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
-from readme_to_mp3 import SAMPLE_RATE, segment_by_language
+from readme_to_mp3 import SAMPLE_RATE, segment_by_language, JAPANESE_PATTERN
 
 DEFAULT_SOCKET = '/tmp/kokoro-tts.sock'
 DEFAULT_PID = '/tmp/kokoro-tts.pid'
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; 0 disables
 
+PROJECT_DIR = Path(__file__).resolve().parent
+VOICES_DIR = PROJECT_DIR / 'voices'
+REGISTRY_PATH = VOICES_DIR / 'registry.json'
+
 last_activity = time.monotonic()
+
+_chatterbox = None
+_chatterbox_lock = threading.Lock()
 
 
 def load_pipelines():
@@ -48,6 +59,75 @@ def load_pipelines():
     print('Creating JP pipeline...', flush=True)
     jp = KPipeline(lang_code='j', repo_id='hexgrad/Kokoro-82M', model=model)
     return en, jp
+
+
+def get_chatterbox():
+    """Lazy-load the Chatterbox cloning model on first use."""
+    global _chatterbox
+    if _chatterbox is not None:
+        return _chatterbox
+    with _chatterbox_lock:
+        if _chatterbox is None:
+            print('Loading Chatterbox model (first use; ~2GB)...', flush=True)
+            from chatterbox.tts import ChatterboxTTS
+            _chatterbox = ChatterboxTTS.from_pretrained(device='mps')
+            print('Chatterbox ready.', flush=True)
+    return _chatterbox
+
+
+def _load_registry() -> dict:
+    """Load voices/registry.json if present, return {} otherwise."""
+    try:
+        with open(REGISTRY_PATH, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def resolve_voice_ref(voice: str) -> Path:
+    """Resolve a voice argument to an absolute WAV path.
+
+    Accepts either a nickname registered in voices/registry.json or a
+    filesystem path (absolute, or relative to the project directory).
+    Raises ValueError if the resolved file does not exist.
+    """
+    if not voice:
+        raise ValueError('chatterbox engine requires a voice (path or nickname)')
+
+    registry = _load_registry()
+    if voice in registry:
+        candidate = Path(registry[voice])
+    else:
+        candidate = Path(voice)
+
+    if not candidate.is_absolute():
+        candidate = PROJECT_DIR / candidate
+
+    if not candidate.is_file():
+        raise ValueError(f'voice reference not found: {candidate}')
+    return candidate
+
+
+def synthesize_chatterbox(text: str, voice: str) -> np.ndarray | None:
+    """Synthesize English-only audio in the cloned voice. Returns float32 PCM
+    at SAMPLE_RATE; resamples if the model emits a different rate."""
+    if JAPANESE_PATTERN.search(text):
+        raise ValueError('Chatterbox is English-only; use engine=kokoro for Japanese text')
+
+    ref_wav = resolve_voice_ref(voice)
+    model = get_chatterbox()
+    wav = model.generate(text, audio_prompt_path=str(ref_wav))
+    if hasattr(wav, 'cpu'):
+        wav = wav.cpu().numpy()
+    audio = np.asarray(wav, dtype=np.float32).squeeze()
+    if audio.size == 0:
+        return None
+
+    src_sr = int(getattr(model, 'sr', SAMPLE_RATE))
+    if src_sr != SAMPLE_RATE:
+        from scipy.signal import resample_poly
+        audio = resample_poly(audio, SAMPLE_RATE, src_sr).astype(np.float32)
+    return audio
 
 
 def synthesize(text, en_pipeline, jp_pipeline, en_voice, jp_voice, switch_gap_ms=60):
@@ -120,12 +200,19 @@ def handle_connection(conn, en_pipeline, jp_pipeline):
                 continue
 
             text = request.get('text', '')
+            engine = request.get('engine', 'kokoro')
             en_voice = request.get('en_voice', 'af_heart')
             jp_voice = request.get('jp_voice', 'jf_alpha')
             switch_gap_ms = request.get('switch_gap_ms', 60)
+            voice = request.get('voice')
 
             try:
-                audio = synthesize(text, en_pipeline, jp_pipeline, en_voice, jp_voice, switch_gap_ms)
+                if engine == 'chatterbox':
+                    audio = synthesize_chatterbox(text, voice)
+                elif engine == 'kokoro':
+                    audio = synthesize(text, en_pipeline, jp_pipeline, en_voice, jp_voice, switch_gap_ms)
+                else:
+                    raise ValueError(f'unknown engine: {engine}')
             except Exception as exc:
                 send_json(conn, {'status': 'error', 'message': str(exc)})
                 continue

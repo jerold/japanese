@@ -517,14 +517,20 @@ class ServerConnection:
         en_voice: str,
         jp_voice: str,
         switch_gap_ms: int,
+        engine: str = 'kokoro',
+        voice: str | None = None,
     ) -> bytes | None:
         """Send a TTS request to the server, return WAV bytes."""
-        request = json.dumps({
+        payload = {
             'text': sentence,
             'en_voice': en_voice,
             'jp_voice': jp_voice,
             'switch_gap_ms': switch_gap_ms,
-        })
+            'engine': engine,
+        }
+        if voice is not None:
+            payload['voice'] = voice
+        request = json.dumps(payload)
         self.sock.sendall(request.encode() + b'\n')
 
         header_line = self.rfile.readline()
@@ -681,6 +687,11 @@ def main() -> int:
                         help='Silence between sentences (default: 150ms)')
     parser.add_argument('--switch-gap-ms', type=int, default=60,
                         help='Silence between language-switched segments within a sentence (default: 60ms)')
+    parser.add_argument('--engine', choices=['kokoro', 'chatterbox'], default='kokoro',
+                        help='TTS engine (default: kokoro). Use chatterbox for cloned voices (English-only, server-only).')
+    parser.add_argument('--voice', default=None,
+                        help='For --engine chatterbox: path to a reference WAV or a '
+                             'nickname registered in voices/registry.json')
     parser.add_argument('--no-server', action='store_true',
                         help='Skip TTS server and load pipelines locally')
     parser.add_argument('--format', choices=['mp3', 'aac'], default='aac',
@@ -717,6 +728,12 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.engine == 'chatterbox':
+        if args.no_server:
+            parser.error('--engine chatterbox requires the TTS server (no --no-server)')
+        if not args.voice:
+            parser.error('--engine chatterbox requires --voice (path or nickname)')
+
     # Try connecting to the TTS server for faster synthesis.
     server = None if args.no_server else ServerConnection.connect()
     en_pipeline = jp_pipeline = None
@@ -734,6 +751,7 @@ def main() -> int:
         if server:
             return server.generate_wav_bytes(
                 sentence, args.en_voice, args.jp_voice, args.switch_gap_ms,
+                engine=args.engine, voice=args.voice,
             )
         return generate_wav_bytes(
             sentence, en_pipeline, jp_pipeline,
